@@ -1,0 +1,30 @@
+# SpectreTTS — requirements.txt
+# Pinned for the ONNX-runtime build (post torch → kokoro-onnx migration).
+#
+# Install inside the project venv (Python 3.11):
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# System packages (NOT pip-installable, install via apt first):
+#   espeak-ng libportaudio2 xclip xdotool python3-gi python3-gi-cairo
+#   gir1.2-gtk-3.0 libayatana-appindicator3-dev gir1.2-ayatanaappindicator3-0.1
+#   libgirepository-2.0-dev pkg-config python3-dev gcc
+
+# ── TTS engine ──────────────────────────────────────────────────────────────
+kokoro-onnx>=0.5.0          # ONNX-runtime Kokoro-82M — replaces torch-based `kokoro`
+onnxruntime>=1.19.0          # CPU inference backend (pulled in by kokoro-onnx, pinned explicitly)
+
+# ── Audio ───────────────────────────────────────────────────────────────────
+soundfile>=0.12.1
+sounddevice>=0.4.7
+
+# ── Systray + GTK UI ────────────────────────────────────────────────────────
+PyGObject>=3.48.0            # GTK3 + AyatanaAppIndicator3 bindings
+
+# ── Notes ───────────────────────────────────────────────────────────────────
+# - PyGObject requires system dev headers (libgirepository-2.0-dev, libcairo2-dev,
+#   pkg-config, python3-dev) present BEFORE `pip install` — see README.md.
+# - torch is intentionally absent: kokoro-onnx drops the full PyTorch dependency
+#   tree, which is the entire point of this build (lower RAM + CPU usage).
+# - Model weights (kokoro-v1.0.onnx, voices-v1.0.bin) are NOT pip packages —
+#   download separately per README.md into ~/.cache/spectretts/models/
