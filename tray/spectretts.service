@@ -1,0 +1,22 @@
+[Unit]
+Description=SpectreTTS - local TTS daemon (Kokoro-82M)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/Local-TTS/.venv/bin/python %h/Projects/Local-TTS/tray/daemon.py
+WorkingDirectory=%h/Projects/Local-TTS
+Restart=on-failure
+RestartSec=3
+
+# Keep restarts from spiraling if something is fundamentally broken
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# GUI app needs access to the X/Wayland display and DBus session
+Environment=DISPLAY=:0
+PassEnvironment=WAYLAND_DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=default.target
