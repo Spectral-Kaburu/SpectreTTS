@@ -51,7 +51,7 @@ if [ "$EXISTING" = "@as []" ]; then
     NEW_LIST="['$FULL_PATH']"
 else
     # Strip trailing ']' and append
-    NEW_LIST=$(echo "$EXISTING" | sed "s/]$/, '$FULL_PATH']/")
+    NEW_LIST=$(echo "$EXISTING" | sed "s|]$|, '$FULL_PATH']|")
 fi
 
 echo "Registering keybinding..."
