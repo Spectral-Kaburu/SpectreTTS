@@ -13,9 +13,11 @@ import threading
 import queue
 import re
 import time
+import asyncio
+import os
 import numpy as np
 import sounddevice as sd
-from kokoro import KPipeline
+from kokoro_onnx import Kokoro
 
 
 # ── Available voices ──────────────────────────────────────────────────────────
@@ -38,16 +40,28 @@ VOICES = {
 }
 
 LANG_CODE_MAP = {
-    "en-us": "a",   # American English
-    "en-gb": "b",   # British English
-    "es":    "e",   # Spanish
-    "fr":    "f",   # French
-    "hi":    "h",   # Hindi
-    "it":    "i",   # Italian
-    "pt-br": "p",   # Brazilian Portuguese
+    "en-us": "en-us",
+    "en-gb": "en-gb",
+    "es":    "es",
+    "fr":    "fr-fr",
+    "hi":    "hi",
+    "it":    "it",
+    "pt-br": "pt-br",
 }
 
-SAMPLE_RATE = 24000  # Kokoro outputs 24kHz
+# kokoro-onnx loads weights from local files rather than auto-downloading
+# from Hugging Face on first use. Download once:
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+MODEL_DIR = os.environ.get(
+    "SPECTRETTS_MODEL_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "spectretts", "models")
+)
+MODEL_PATH = os.path.join(MODEL_DIR, "kokoro-v1.0.onnx")
+VOICES_PATH = os.path.join(MODEL_DIR, "voices-v1.0.bin")
+
+# Note: sample rate is no longer a fixed constant — kokoro-onnx returns it
+# per-call from create_stream(), so we use whatever it reports (typically 24000Hz).
 
 
 # ── Text Preprocessing ────────────────────────────────────────────────────────
@@ -55,7 +69,9 @@ SAMPLE_RATE = 24000  # Kokoro outputs 24kHz
 def preprocess_text(text: str) -> str:
     """
     Clean raw text before sending to Kokoro.
-    Handles: URLs, markdown, code blocks, symbols, excess whitespace.
+    Handles: URLs, markdown, code blocks, symbols, excess whitespace,
+    soft-wrapped newlines, and false sentence-boundary periods
+    (file extensions, abbreviations, decimals, ellipses).
     """
     # Strip code blocks entirely (not useful to read aloud)
     text = re.sub(r"```[\s\S]*?```", " [code block omitted] ", text)
@@ -82,42 +98,113 @@ def preprocess_text(text: str) -> str:
     # HTML tags (if any)
     text = re.sub(r"<[^>]+>", " ", text)
 
-    # Collapse excess whitespace/newlines
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # ── Soft-wrap newline handling ──────────────────────────────────────────
+    # A single \n is almost always a line-wrap for spacing, not a real
+    # paragraph break — collapse it to a space. A double \n (blank line)
+    # IS an intentional paragraph break, so preserve it as one.
+    text = re.sub(r"\n{2,}", "<<<PARA_BREAK>>>", text)   # protect real breaks
+    text = re.sub(r"\n", " ", text)                       # collapse soft wraps
+    text = text.replace("<<<PARA_BREAK>>>", "\n\n")        # restore real breaks
+
+    # ── False sentence-boundary protection ──────────────────────────────────
+    # Protect periods that are NOT real sentence endings by temporarily
+    # swapping them for a placeholder, so our chunker's '.!?' split
+    # doesn't fire on them and Kokoro's phonemizer doesn't either.
+
+    PERIOD_PLACEHOLDER = "<<<DOT>>>"
+
+    # File extensions: word.ext (common code/doc extensions)
+    text = re.sub(
+        r"\.(py|js|json|md|txt|yml|yaml|csv|xlsx|docx|pdf|html|css|sh|cfg|"
+        r"ini|toml|env|jpg|png|svg|mp3|mp4|zip|tar|gz)\b",
+        PERIOD_PLACEHOLDER + r"\1",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Common abbreviations (Mr. Mrs. Dr. e.g. i.e. etc. vs. approx.)
+    text = re.sub(
+        r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|approx|e\.g|i\.e|a\.m|p\.m)\.",
+        r"\1" + PERIOD_PLACEHOLDER,
+        text
+    )
+
+    # Decimal numbers: 3.14, 1.5x, 192.168.1.1 etc.
+    text = re.sub(
+        r"(\d)\.(\d)",
+        r"\1" + PERIOD_PLACEHOLDER + r"\2",
+        text
+    )
+    # Run twice to catch chained decimals like IP addresses (192.168.1.1)
+    text = re.sub(
+        r"(\d)\.(\d)",
+        r"\1" + PERIOD_PLACEHOLDER + r"\2",
+        text
+    )
+
+    # Single-letter initials: J. K. Rowling
+    text = re.sub(
+        r"\b([A-Z])\.(\s[A-Z]\b)",
+        r"\1" + PERIOD_PLACEHOLDER + r"\2",
+        text
+    )
+
+    # Ellipses: collapse "..." to a single placeholder dot so it doesn't
+    # read as three separate sentence-ending pauses
+    text = re.sub(r"\.{3,}", PERIOD_PLACEHOLDER, text)
+
+    # Restore protected periods now that real sentence boundaries are safe
+    text = text.replace(PERIOD_PLACEHOLDER, ".")
+
+    # Collapse excess whitespace
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)   # trim spaces around real paragraph breaks
 
     return text.strip()
 
 
-def split_into_chunks(text: str, max_chars: int = 400) -> list[str]:
+def split_into_chunks(text: str, max_chars: int = 400, first_chunk_max: int = 120) -> list[str]:
     """
     Split long text at sentence boundaries for streaming.
     Keeps chunks under max_chars so each synthesizes quickly.
+
+    The FIRST chunk is capped much smaller (first_chunk_max) so synthesis
+    starts and audio begins playing as fast as possible — the user hears
+    something within ~1 sentence instead of waiting for a full ~400-char
+    chunk to be built before the first synthesis call even starts.
     """
-    # Split on sentence-ending punctuation
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    # Split on sentence-ending punctuation (paragraph breaks treated as
+    # hard boundaries too, so a paragraph never gets silently merged)
+    text = text.replace("\n\n", " \n\n ")  # ensure paragraph breaks split cleanly
+    sentences = re.split(r'(?<=[.!?])\s+|\n\n', text)
 
     chunks = []
     current = ""
+    is_first = True
+    limit = first_chunk_max
 
     for sentence in sentences:
         if not sentence.strip():
             continue
-        if len(current) + len(sentence) <= max_chars:
+        if len(current) + len(sentence) <= limit:
             current += (" " if current else "") + sentence
         else:
             if current:
                 chunks.append(current.strip())
+                is_first = False
+                limit = max_chars
             # If a single sentence is huge, split it on commas
-            if len(sentence) > max_chars:
+            if len(sentence) > limit:
                 parts = re.split(r'(?<=,)\s+', sentence)
                 sub = ""
                 for part in parts:
-                    if len(sub) + len(part) <= max_chars:
+                    if len(sub) + len(part) <= limit:
                         sub += (" " if sub else "") + part
                     else:
                         if sub:
                             chunks.append(sub.strip())
+                            is_first = False
+                            limit = max_chars
                         sub = part
                 if sub:
                     chunks.append(sub.strip())
@@ -140,7 +227,7 @@ class TTSEngine:
     """
 
     def __init__(self):
-        self._pipelines: dict[str, KPipeline] = {}   # lang_code → pipeline
+        self._kokoro: Kokoro | None = None   # single shared instance, loaded lazily
         self._lock = threading.Lock()
 
         # Playback state
@@ -154,25 +241,35 @@ class TTSEngine:
         self._is_speaking = False
 
         # Settings
-        self.voice = "bf_emma"
+        self.voice = "af_heart"
         self.speed = 1.0
 
     # ── Pipeline management ───────────────────────────────────────────────────
 
-    def _get_pipeline(self, lang_code: str) -> KPipeline:
-        """Get or lazily create a pipeline for the given lang_code."""
-        if lang_code not in self._pipelines:
-            print(f"[SpectreTTS] Loading pipeline for lang_code='{lang_code}'...")
-            self._pipelines[lang_code] = KPipeline(lang_code=lang_code)
-            print(f"[SpectreTTS] Pipeline ready.")
-        return self._pipelines[lang_code]
+    def _get_kokoro(self) -> Kokoro:
+        """Lazily load the shared ONNX Kokoro instance (loads once, reused for all voices/langs)."""
+        if self._kokoro is None:
+            with self._lock:
+                if self._kokoro is None:   # re-check inside lock
+                    if not os.path.exists(MODEL_PATH) or not os.path.exists(VOICES_PATH):
+                        raise FileNotFoundError(
+                            f"Kokoro ONNX model files not found.\n"
+                            f"Expected:\n  {MODEL_PATH}\n  {VOICES_PATH}\n"
+                            f"Download them from:\n"
+                            f"  https://github.com/thewh1teagle/kokoro-onnx/releases\n"
+                            f"into {MODEL_DIR}"
+                        )
+                    print(f"[SpectreTTS] Loading Kokoro ONNX model from {MODEL_DIR}...")
+                    self._kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
+                    print(f"[SpectreTTS] Model ready.")
+        return self._kokoro
 
-    def _get_lang_code(self) -> str:
+    def _get_lang(self) -> str:
         voice_info = VOICES.get(self.voice)
         if not voice_info:
-            return "a"
+            return "en-us"
         locale = voice_info[1]
-        return LANG_CODE_MAP.get(locale, "a")
+        return LANG_CODE_MAP.get(locale, "en-us")
 
     # ── Public controls ───────────────────────────────────────────────────────
 
@@ -251,28 +348,40 @@ class TTSEngine:
     # ── Internal synthesis ─────────────────────────────────────────────────────
 
     def _synthesize(self, text: str):
-        """Run in background thread. Synthesizes chunks and puts audio in queue."""
+        """
+        Run in background thread. Synthesizes chunks and puts audio in queue.
+        kokoro-onnx's create_stream() is async, so we run a small event loop
+        inside this thread to drive it — the rest of the engine (threading,
+        queue, playback) stays exactly as it was with the PyTorch backend.
+        """
         try:
-            lang_code = self._get_lang_code()
-            pipeline = self._get_pipeline(lang_code)
+            kokoro = self._get_kokoro()
+            lang = self._get_lang()
             chunks = split_into_chunks(text)
 
             for chunk in chunks:
                 if self._stop_event.is_set():
                     break
 
-                generator = pipeline(chunk, voice=self.voice, speed=self.speed)
-                for _, _, audio in generator:
-                    if self._stop_event.is_set():
-                        break
-                    if audio is not None and len(audio) > 0:
-                        self._audio_queue.put(audio)
+                asyncio.run(self._synthesize_chunk(kokoro, chunk, lang))
 
+        except FileNotFoundError as e:
+            print(f"[SpectreTTS] Model files missing: {e}")
         except Exception as e:
             print(f"[SpectreTTS] Synthesis error: {e}")
         finally:
             # Sentinel: tells playback thread synthesis is done
             self._audio_queue.put(None)
+
+    async def _synthesize_chunk(self, kokoro: Kokoro, chunk: str, lang: str):
+        """Streams one text chunk's audio samples into the playback queue as they're generated."""
+        async for audio, sample_rate in kokoro.create_stream(
+            chunk, voice=self.voice, speed=self.speed, lang=lang
+        ):
+            if self._stop_event.is_set():
+                break
+            if audio is not None and len(audio) > 0:
+                self._audio_queue.put((audio, sample_rate))
 
     # ── Internal playback ──────────────────────────────────────────────────────
 
@@ -288,13 +397,15 @@ class TTSEngine:
                 if chunk is None:   # synthesis done
                     break
 
+                audio, sample_rate = chunk
+
                 # Pause support: block here until resumed or stopped
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     break
 
                 # Play this chunk synchronously
-                sd.play(chunk, samplerate=SAMPLE_RATE)
+                sd.play(audio, samplerate=sample_rate)
                 sd.wait()
 
         except Exception as e:
@@ -306,6 +417,8 @@ class TTSEngine:
 # ── Quick smoke test ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
+
     engine = TTSEngine()
 
     print("=== SpectreTTS Engine Smoke Test ===")
@@ -323,4 +436,12 @@ if __name__ == "__main__":
     while engine.is_speaking:
         time.sleep(0.2)
 
-    print("Done. Engine test passed.")
+    # Real pass/fail check: did any audio actually get synthesized and queued?
+    # _is_speaking flips false both on success AND on total failure, so we
+    # can't rely on it alone — check that the model actually loaded.
+    if engine._kokoro is None:
+        print("FAILED: model never loaded — check the error above.")
+        sys.exit(1)
+
+    print("PASSED: model loaded and synthesis ran without raising.")
+
