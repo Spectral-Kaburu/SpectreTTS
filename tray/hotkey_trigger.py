@@ -16,7 +16,7 @@ import socket
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "engine"))
 from selection_grabber import get_text_to_read
 
 SOCKET_PATH = "/tmp/spectretts.sock"
@@ -28,7 +28,7 @@ def notify(message: str, urgency: str = "normal"):
         import subprocess
         subprocess.run(
             ["notify-send", "-u", urgency, "SpectreTTS", message],
-            timeout=5
+            timeout=2
         )
     except Exception:
         pass  # notifications are a nice-to-have, never block on this
