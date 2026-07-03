@@ -71,7 +71,14 @@ def preprocess_text(text: str) -> str:
     Clean raw text before sending to Kokoro.
     Handles: URLs, markdown, code blocks, symbols, excess whitespace,
     soft-wrapped newlines, and false sentence-boundary periods
-    (file extensions, abbreviations, decimals, ellipses).
+    (file extensions, abbreviations, ellipses).
+
+    Sentence-boundary rule: only ". " (period followed by a space) is
+    treated as the end of a sentence. A "." with no trailing space is
+    never a sentence break — if it sits between two digits it's spoken
+    aloud as "point" (see below); otherwise it's assumed to be a file
+    extension, abbreviation, or similar and is protected from the
+    chunker/phonemizer entirely.
     """
     # Strip code blocks entirely (not useful to read aloud)
     text = re.sub(r"```[\s\S]*?```", " [code block omitted] ", text)
@@ -107,53 +114,79 @@ def preprocess_text(text: str) -> str:
     text = text.replace("<<<PARA_BREAK>>>", "\n\n")        # restore real breaks
 
     # ── False sentence-boundary protection ──────────────────────────────────
-    # Protect periods that are NOT real sentence endings by temporarily
-    # swapping them for a placeholder, so our chunker's '.!?' split
-    # doesn't fire on them and Kokoro's phonemizer doesn't either.
+    # Protect periods that are NOT real sentence endings so our chunker's
+    # '.!?' split doesn't fire on them AND — this is the part the old
+    # version got wrong — so Kokoro's phonemizer never actually sees a
+    # bare "." there either. A literal "." in the final string produces a
+    # short full-stop pause no matter what precedes it or why it's there;
+    # "restore the placeholder back to '.'" was fine for the chunker but
+    # left that pause fully intact for playback. Fixed below by never
+    # restoring to "." for anything that isn't a genuine sentence end:
+    # abbreviations get expanded to their full spoken word instead, and
+    # any other no-space dot (code, filenames, domains) becomes the
+    # spoken word "dot" — same treatment decimals already get as "point".
 
     PERIOD_PLACEHOLDER = "<<<DOT>>>"
 
-    # File extensions: word.ext (common code/doc extensions)
-    text = re.sub(
-        r"\.(py|js|json|md|txt|yml|yaml|csv|xlsx|docx|pdf|html|css|sh|cfg|"
-        r"ini|toml|env|jpg|png|svg|mp3|mp4|zip|tar|gz)\b",
-        PERIOD_PLACEHOLDER + r"\1",
-        text,
-        flags=re.IGNORECASE
-    )
+    # Ellipses first, before anything else touches individual dots inside
+    # "...": collapse to a single placeholder so it reads as one trailing
+    # pause instead of three run-on sentence endings.
+    text = re.sub(r"\.{3,}", PERIOD_PLACEHOLDER, text)
 
-    # Common abbreviations (Mr. Mrs. Dr. e.g. i.e. etc. vs. approx.)
-    text = re.sub(
-        r"\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|approx|e\.g|i\.e|a\.m|p\.m)\.",
-        r"\1" + PERIOD_PLACEHOLDER,
-        text
-    )
+    # Multi-dot abbreviations (each has a period baked into the token
+    # itself, not just a trailing one) — expand wholesale.
+    text = re.sub(r"\be\.g\.", "for example", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bi\.e\.", "that is", text, flags=re.IGNORECASE)
+    text = re.sub(r"\ba\.m\.", "AM", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bp\.m\.", "PM", text, flags=re.IGNORECASE)
 
-    # Decimal numbers: 3.14, 1.5x, 192.168.1.1 etc.
-    text = re.sub(
-        r"(\d)\.(\d)",
-        r"\1" + PERIOD_PLACEHOLDER + r"\2",
-        text
-    )
-    # Run twice to catch chained decimals like IP addresses (192.168.1.1)
-    text = re.sub(
-        r"(\d)\.(\d)",
-        r"\1" + PERIOD_PLACEHOLDER + r"\2",
-        text
-    )
+    # Single-dot abbreviations — expand to the full word and drop the
+    # period. This is what actually fixes "Mr. Smith": before, "Mr."
+    # survived all the way to Kokoro as a literal period, which read as
+    # a tiny full stop between "Mr" and "Smith" regardless of chunking.
+    SINGLE_DOT_ABBREVIATIONS = {
+        "Mr": "Mister", "Mrs": "Missus", "Ms": "Miz", "Dr": "Doctor",
+        "Prof": "Professor", "Sr": "Senior", "Jr": "Junior",
+        "vs": "versus", "etc": "et cetera", "approx": "approximately",
+    }
+    for abbr, replacement in SINGLE_DOT_ABBREVIATIONS.items():
+        text = re.sub(rf"\b{abbr}\.", replacement, text)
 
-    # Single-letter initials: J. K. Rowling
+    # "St." is genuinely ambiguous (Saint vs. Street — "St. Louis" vs.
+    # "5th St.") so it isn't expanded; just drop the period and let the
+    # phonemizer's own built-in abbreviation handling take it from there.
+    text = re.sub(r"\bSt\.", "St", text)
+
+    # Decimal / numeric "dot": a period with NO space after it, sitting
+    # between two digits, is never a sentence boundary — it's a spoken
+    # "point" (3.14 -> "three point one four", 192.168.1.1 -> "one
+    # ninety-two point one sixty-eight point one point one"). The
+    # lookahead (?=\d) — instead of consuming the next digit — lets a
+    # single pass catch chained decimals like IP addresses without
+    # needing to run the substitution twice.
+    text = re.sub(r"(\d)\.(?=\d)", r"\1 point ", text)
+
+    # Single-letter initials: J. K. Rowling — protected with a placeholder
+    # (not expanded to a word) since there's genuinely nothing to expand
+    # to; the chunker just needs to not split between "J." and "K.".
     text = re.sub(
         r"\b([A-Z])\.(\s[A-Z]\b)",
         r"\1" + PERIOD_PLACEHOLDER + r"\2",
         text
     )
 
-    # Ellipses: collapse "..." to a single placeholder dot so it doesn't
-    # read as three separate sentence-ending pauses
-    text = re.sub(r"\.{3,}", PERIOD_PLACEHOLDER, text)
+    # Everything else: any "." with NO space after it, immediately
+    # followed by a letter or digit — filenames (report.docx), code
+    # (sd.wait()), domains (example.com), acronyms (U.S.) — gets spoken
+    # as "dot" instead of left as a bare period. This replaces the old
+    # fixed file-extension whitelist entirely: it's more general (works
+    # for ANY dotted identifier, not just a hardcoded extension list) and
+    # it fixes the same pause problem, since "dot" is also just how
+    # people actually read these aloud.
+    text = re.sub(r"\.(?=[A-Za-z0-9])", " dot ", text)
 
-    # Restore protected periods now that real sentence boundaries are safe
+    # Restore protected periods (currently just the initials case) now
+    # that real sentence boundaries are safe
     text = text.replace(PERIOD_PLACEHOLDER, ".")
 
     # Collapse excess whitespace
@@ -163,15 +196,31 @@ def preprocess_text(text: str) -> str:
     return text.strip()
 
 
-def split_into_chunks(text: str, max_chars: int = 400, first_chunk_max: int = 120) -> list[str]:
+def split_into_chunks(
+    text: str,
+    max_chars: int = 260,
+    chunk_size_ramp: tuple[int, ...] = (90, 160, 260),
+) -> list[str]:
     """
     Split long text at sentence boundaries for streaming.
     Keeps chunks under max_chars so each synthesizes quickly.
 
-    The FIRST chunk is capped much smaller (first_chunk_max) so synthesis
-    starts and audio begins playing as fast as possible — the user hears
-    something within ~1 sentence instead of waiting for a full ~400-char
-    chunk to be built before the first synthesis call even starts.
+    Chunk sizes RAMP UP instead of jumping straight from a small first
+    chunk to a full-size one (chunk_size_ramp, then max_chars for every
+    chunk after). Going small -> small -> small -> full smooths out the
+    "lag after the first utterance" problem: on weak hardware, synthesis
+    of one big ~400-char chunk can take noticeably longer than it takes
+    to play the small first chunk, so the playback queue can run dry
+    right after chunk #1 while synthesis is still grinding through
+    chunk #2. A gentler ramp keeps every early synthesis call short
+    enough that it reliably finishes before the previous chunk stops
+    playing, at the cost of very slightly choppier prosody at those
+    extra chunk boundaries (each chunk boundary resets Kokoro's local
+    prosody state). max_chars was also lowered from 400 to 260: past
+    ~250-300 chars the per-chunk synthesis time starts to dominate
+    perceived latency on slow CPUs, with no real naturalness gain from
+    going bigger since chunks already break on real sentence/paragraph
+    boundaries either way.
     """
     # Split on sentence-ending punctuation (paragraph breaks treated as
     # hard boundaries too, so a paragraph never gets silently merged)
@@ -180,8 +229,15 @@ def split_into_chunks(text: str, max_chars: int = 400, first_chunk_max: int = 12
 
     chunks = []
     current = ""
-    is_first = True
-    limit = first_chunk_max
+    ramp_idx = 0
+    limit = chunk_size_ramp[0] if chunk_size_ramp else max_chars
+
+    def next_limit():
+        nonlocal ramp_idx
+        ramp_idx += 1
+        if ramp_idx < len(chunk_size_ramp):
+            return chunk_size_ramp[ramp_idx]
+        return max_chars
 
     for sentence in sentences:
         if not sentence.strip():
@@ -191,8 +247,7 @@ def split_into_chunks(text: str, max_chars: int = 400, first_chunk_max: int = 12
         else:
             if current:
                 chunks.append(current.strip())
-                is_first = False
-                limit = max_chars
+                limit = next_limit()
             # If a single sentence is huge, split it on commas
             if len(sentence) > limit:
                 parts = re.split(r'(?<=,)\s+', sentence)
@@ -203,8 +258,7 @@ def split_into_chunks(text: str, max_chars: int = 400, first_chunk_max: int = 12
                     else:
                         if sub:
                             chunks.append(sub.strip())
-                            is_first = False
-                            limit = max_chars
+                            limit = next_limit()
                         sub = part
                 if sub:
                     chunks.append(sub.strip())
@@ -386,7 +440,24 @@ class TTSEngine:
     # ── Internal playback ──────────────────────────────────────────────────────
 
     def _play_audio(self):
-        """Run in background thread. Plays audio chunks from the queue."""
+        """
+        Run in background thread. Plays audio pieces from the queue.
+
+        Uses ONE persistent sd.OutputStream for the whole utterance instead
+        of calling sd.play()/sd.wait() per queued piece. This matters because
+        kokoro.create_stream() doesn't yield one array per text chunk — it
+        streams many smaller audio pieces as they're generated, and those
+        pieces tend to be smaller/more frequent right at the start before
+        settling into steadier, larger ones. Each sd.play() call opens the
+        audio device and each sd.wait() closes it; back-to-back small pieces
+        means back-to-back open/close cycles, and that device-restart
+        overhead is exactly what was showing up as choppiness in the first
+        2-3 sentences — not the text or a prosody issue, a playback-plumbing
+        one. Writing into one continuous stream removes the gap regardless
+        of how small or frequent the pieces are.
+        """
+        stream = None
+        stream_rate = None
         try:
             while not self._stop_event.is_set():
                 try:
@@ -404,13 +475,32 @@ class TTSEngine:
                 if self._stop_event.is_set():
                     break
 
-                # Play this chunk synchronously
-                sd.play(audio, samplerate=sample_rate)
-                sd.wait()
+                # (Re)open the stream only when needed: first piece, or if
+                # the sample rate ever changes mid-utterance (shouldn't
+                # normally happen, but voices/langs could in theory differ).
+                if stream is None or sample_rate != stream_rate:
+                    if stream is not None:
+                        stream.stop()
+                        stream.close()
+                    stream = sd.OutputStream(
+                        samplerate=sample_rate,
+                        channels=1,
+                        dtype="float32",
+                    )
+                    stream.start()
+                    stream_rate = sample_rate
+
+                stream.write(np.ascontiguousarray(audio, dtype=np.float32))
 
         except Exception as e:
             print(f"[SpectreTTS] Playback error: {e}")
         finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
             self._is_speaking = False
 
 
@@ -444,4 +534,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("PASSED: model loaded and synthesis ran without raising.")
-
+    
