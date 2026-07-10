@@ -198,8 +198,8 @@ def preprocess_text(text: str) -> str:
 
 def split_into_chunks(
     text: str,
-    max_chars: int = 260,
-    chunk_size_ramp: tuple[int, ...] = (90, 160, 260),
+    max_chars: int = 350,
+    chunk_size_ramp: tuple[int, ...] = (90, 160, 260, 350),
 ) -> list[str]:
     """
     Split long text at sentence boundaries for streaming.
