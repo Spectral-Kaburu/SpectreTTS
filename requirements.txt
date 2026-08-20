@@ -14,6 +14,9 @@
 kokoro-onnx>=0.5.0          # ONNX-runtime Kokoro-82M — replaces torch-based `kokoro`
 onnxruntime>=1.19.0          # CPU inference backend (pulled in by kokoro-onnx, pinned explicitly)
 
+# ── Config ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0         # Load .env file for configuration
+
 # ── Audio ───────────────────────────────────────────────────────────────────
 soundfile>=0.12.1
 sounddevice>=0.4.7

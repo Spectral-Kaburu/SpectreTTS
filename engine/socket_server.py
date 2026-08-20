@@ -15,7 +15,9 @@ import socket
 import os
 import threading
 
-SOCKET_PATH = "/tmp/spectretts.sock"
+from .configs import get_socket_path
+
+SOCKET_PATH = get_socket_path()
 
 
 class SocketServer:

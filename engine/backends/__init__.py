@@ -1,5 +1,4 @@
-import os
-
+from ..configs import get_backend_name
 from .base import TTSBackend
 from .kokoro_backend import KokoroBackend
 from .pocket_backend import PocketBackend
@@ -14,11 +13,11 @@ def get_backend(name: str = None) -> TTSBackend:
     """
     Resolve which backend to instantiate.
 
-    Priority: explicit `name` arg > SPECTRETTS_BACKEND env var >
+    Priority: explicit `name` arg > SPECTRETTS_BACKEND env var (via config) >
     "kokoro" (unchanged default so existing installs/configs keep
     working exactly as before with zero changes required).
     """
-    key = (name or os.environ.get("SPECTRETTS_BACKEND", "kokoro")).strip().lower()
+    key = (name or get_backend_name()).strip().lower()
     try:
         backend_cls = _REGISTRY[key]
     except KeyError:
