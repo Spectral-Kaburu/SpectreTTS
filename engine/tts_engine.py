@@ -1,74 +1,47 @@
 """
 SpectreTTS - Core Engine
 ------------------------
-Wraps Kokoro-82M with:
-  - Lazy model loading (loads once, stays warm)
+Backend-agnostic TTS engine:
+  - Lazy model loading (loads once, stays warm) — delegated to a
+    TTSBackend (Kokoro, Pocket-TTS, ...); see engine/backends/
   - Streaming chunk playback (audio starts before full synthesis)
   - Playback controls: pause, resume, stop
   - Voice + speed management
   - Text preprocessing (cleans URLs, markdown, symbols)
+
+Which backend is active is chosen once at TTSEngine construction time
+(SPECTRETTS_BACKEND env var, defaulting to "kokoro" — see
+engine/backends/__init__.py::get_backend). Everything below this point
+never imports kokoro_onnx or pocket_tts directly; it only talks to the
+TTSBackend interface, so swapping backends never touches this file.
 """
 
 import threading
 import queue
 import re
 import time
-import asyncio
-import os
 import numpy as np
 import sounddevice as sd
-from kokoro_onnx import Kokoro
 
+from .backends import get_backend
 
-# ── Available voices ──────────────────────────────────────────────────────────
-VOICES = {
-    # American English (Female)
-    "af_heart":   ("Heart",   "en-us", "female"),
-    "af_bella":   ("Bella",   "en-us", "female"),
-    "af_nicole":  ("Nicole",  "en-us", "female"),
-    "af_sarah":   ("Sarah",   "en-us", "female"),
-    "af_sky":     ("Sky",     "en-us", "female"),
-    # American English (Male)
-    "am_adam":    ("Adam",    "en-us", "male"),
-    "am_michael": ("Michael", "en-us", "male"),
-    # British English (Female)
-    "bf_emma":    ("Emma",    "en-gb", "female"),
-    "bf_isabella":("Isabella","en-gb", "female"),
-    # British English (Male)
-    "bm_george":  ("George",  "en-gb", "male"),
-    "bm_lewis":   ("Lewis",   "en-gb", "male"),
-}
+# Kept importable from here for backward compatibility — tray/systray_app.py
+# does `from engine.tts_engine import VOICES` to build the voice menu.
+# This now reflects whichever backend is actually active, so the tray
+# menu lists Kokoro voices or Pocket-TTS voices automatically depending
+# on SPECTRETTS_BACKEND, with no tray-side changes needed.
+VOICES = get_backend().voices
 
-LANG_CODE_MAP = {
-    "en-us": "en-us",
-    "en-gb": "en-gb",
-    "es":    "es",
-    "fr":    "fr-fr",
-    "hi":    "hi",
-    "it":    "it",
-    "pt-br": "pt-br",
-}
-
-# kokoro-onnx loads weights from local files rather than auto-downloading
-# from Hugging Face on first use. Download once:
-#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
-#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
-MODEL_DIR = os.environ.get(
-    "SPECTRETTS_MODEL_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "spectretts", "models")
-)
-MODEL_PATH = os.path.join(MODEL_DIR, "kokoro-v1.0.onnx")
-VOICES_PATH = os.path.join(MODEL_DIR, "voices-v1.0.bin")
-
-# Note: sample rate is no longer a fixed constant — kokoro-onnx returns it
-# per-call from create_stream(), so we use whatever it reports (typically 24000Hz).
+# Note: sample rate isn't a fixed constant — each backend reports it
+# per-chunk (kokoro-onnx via create_stream(), Pocket-TTS via
+# model.sample_rate), so playback just uses whatever it's told.
 
 
 # ── Text Preprocessing ────────────────────────────────────────────────────────
 
 def preprocess_text(text: str) -> str:
     """
-    Clean raw text before sending to Kokoro.
+    Clean raw text before sending it to the TTS backend.
     Handles: URLs, markdown, code blocks, symbols, excess whitespace,
     soft-wrapped newlines, and false sentence-boundary periods
     (file extensions, abbreviations, ellipses).
@@ -276,12 +249,17 @@ def split_into_chunks(
 
 class TTSEngine:
     """
-    The main engine. Loads Kokoro once, streams audio in a background thread.
+    The main engine. Loads the active backend's model once, streams audio
+    in a background thread.
     Thread-safe pause/resume/stop controls.
     """
 
-    def __init__(self):
-        self._kokoro: Kokoro | None = None   # single shared instance, loaded lazily
+    def __init__(self, backend: str = None):
+        """
+        backend: "kokoro", "pocket", or None to follow SPECTRETTS_BACKEND
+        (defaults to "kokoro" if that's unset too — see backends/__init__.py).
+        """
+        self.backend = get_backend(backend)
         self._lock = threading.Lock()
 
         # Playback state
@@ -295,35 +273,13 @@ class TTSEngine:
         self._is_speaking = False
 
         # Settings
-        self.voice = "af_heart"
+        self.voice = self.backend.default_voice
         self.speed = 1.0
 
     # ── Pipeline management ───────────────────────────────────────────────────
 
-    def _get_kokoro(self) -> Kokoro:
-        """Lazily load the shared ONNX Kokoro instance (loads once, reused for all voices/langs)."""
-        if self._kokoro is None:
-            with self._lock:
-                if self._kokoro is None:   # re-check inside lock
-                    if not os.path.exists(MODEL_PATH) or not os.path.exists(VOICES_PATH):
-                        raise FileNotFoundError(
-                            f"Kokoro ONNX model files not found.\n"
-                            f"Expected:\n  {MODEL_PATH}\n  {VOICES_PATH}\n"
-                            f"Download them from:\n"
-                            f"  https://github.com/thewh1teagle/kokoro-onnx/releases\n"
-                            f"into {MODEL_DIR}"
-                        )
-                    print(f"[SpectreTTS] Loading Kokoro ONNX model from {MODEL_DIR}...")
-                    self._kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
-                    print(f"[SpectreTTS] Model ready.")
-        return self._kokoro
-
     def _get_lang(self) -> str:
-        voice_info = VOICES.get(self.voice)
-        if not voice_info:
-            return "en-us"
-        locale = voice_info[1]
-        return LANG_CODE_MAP.get(locale, "en-us")
+        return self.backend.lang_for_voice(self.voice)
 
     # ── Public controls ───────────────────────────────────────────────────────
 
@@ -393,10 +349,16 @@ class TTSEngine:
         return self._is_speaking
 
     def set_voice(self, voice_id: str):
-        if voice_id in VOICES:
+        if voice_id in self.backend.voices:
             self.voice = voice_id
 
     def set_speed(self, speed: float):
+        if not self.backend.supports_speed:
+            print(
+                f"[SpectreTTS] Backend '{self.backend.id}' has no speed control — "
+                f"ignoring set_speed({speed})."
+            )
+            return
         self.speed = max(0.5, min(2.0, speed))
 
     # ── Internal synthesis ─────────────────────────────────────────────────────
@@ -404,12 +366,12 @@ class TTSEngine:
     def _synthesize(self, text: str):
         """
         Run in background thread. Synthesizes chunks and puts audio in queue.
-        kokoro-onnx's create_stream() is async, so we run a small event loop
-        inside this thread to drive it — the rest of the engine (threading,
-        queue, playback) stays exactly as it was with the PyTorch backend.
+        Actual model-specific synthesis is delegated to self.backend —
+        it pushes (audio, sample_rate) tuples onto self._audio_queue as
+        they become available, whatever shape that takes internally
+        (async event loop for Kokoro, plain generator for Pocket-TTS, etc).
         """
         try:
-            kokoro = self._get_kokoro()
             lang = self._get_lang()
             chunks = split_into_chunks(text)
 
@@ -417,7 +379,10 @@ class TTSEngine:
                 if self._stop_event.is_set():
                     break
 
-                asyncio.run(self._synthesize_chunk(kokoro, chunk, lang))
+                self.backend.synthesize_chunk(
+                    chunk, self.voice, self.speed, lang,
+                    self._audio_queue, self._stop_event,
+                )
 
         except FileNotFoundError as e:
             print(f"[SpectreTTS] Model files missing: {e}")
@@ -426,16 +391,6 @@ class TTSEngine:
         finally:
             # Sentinel: tells playback thread synthesis is done
             self._audio_queue.put(None)
-
-    async def _synthesize_chunk(self, kokoro: Kokoro, chunk: str, lang: str):
-        """Streams one text chunk's audio samples into the playback queue as they're generated."""
-        async for audio, sample_rate in kokoro.create_stream(
-            chunk, voice=self.voice, speed=self.speed, lang=lang
-        ):
-            if self._stop_event.is_set():
-                break
-            if audio is not None and len(audio) > 0:
-                self._audio_queue.put((audio, sample_rate))
 
     # ── Internal playback ──────────────────────────────────────────────────────
 
@@ -509,15 +464,18 @@ class TTSEngine:
 if __name__ == "__main__":
     import sys
 
-    engine = TTSEngine()
+    # Optional: `python -m engine.tts_engine pocket` to smoke-test a
+    # specific backend without touching SPECTRETTS_BACKEND.
+    backend_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    engine = TTSEngine(backend=backend_arg)
 
     print("=== SpectreTTS Engine Smoke Test ===")
-    print(f"Voice: {engine.voice} | Speed: {engine.speed}x")
+    print(f"Backend: {engine.backend.id} | Voice: {engine.voice} | Speed: {engine.speed}x")
     print("Speaking test sentence...")
 
     engine.speak(
         "SpectreTTS engine initialized. "
-        "Kokoro is loaded and audio is streaming in real time. "
+        "The model is loaded and audio is streaming in real time. "
         "The engine is ready for integration."
     )
 
@@ -526,10 +484,13 @@ if __name__ == "__main__":
     while engine.is_speaking:
         time.sleep(0.2)
 
-    # Real pass/fail check: did any audio actually get synthesized and queued?
-    # _is_speaking flips false both on success AND on total failure, so we
-    # can't rely on it alone — check that the model actually loaded.
-    if engine._kokoro is None:
+    # Real pass/fail check: did any audio actually get synthesized?
+    # _is_speaking flips false both on success AND on total failure, so
+    # check the backend's own "did I load" state instead. Every backend
+    # keeps its loaded model on self._model or self._kokoro — check
+    # whichever this backend actually set.
+    loaded = getattr(engine.backend, "_model", None) or getattr(engine.backend, "_kokoro", None)
+    if loaded is None:
         print("FAILED: model never loaded — check the error above.")
         sys.exit(1)
 
