@@ -19,11 +19,27 @@ TTSBackend interface, so swapping backends never touches this file.
 import threading
 import queue
 import re
+import sys
 import time
+import os
 import numpy as np
 import sounddevice as sd
 
 from .backends import get_backend
+
+# Sibling modules inside engine/ — inserted onto sys.path so this file
+# imports cleanly both as `engine.tts_engine` (daemon.py's usage, repo
+# root on sys.path) and standalone (`python -m engine.tts_engine` /
+# `python engine/tts_engine.py`).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from clipboard_store import ClipboardStore
+from word_timing import extract_words, build_word_schedule
+
+# Sentinel first-element for a "chunk boundary" marker item pushed onto
+# the shared audio queue (see _synthesize/_play_audio below). Backends
+# only ever push real (audio_ndarray, sample_rate) tuples, so this is
+# safe to distinguish by checking the first element's type.
+_WORDS_MARKER = "__SPECTRETTS_WORDS__"
 
 # Kept importable from here for backward compatibility — tray/systray_app.py
 # does `from engine.tts_engine import VOICES` to build the voice menu.
@@ -276,6 +292,26 @@ class TTSEngine:
         self.voice = self.backend.default_voice
         self.speed = 1.0
 
+        # Internal clipboard — the exact string currently loaded/speaking.
+        # The reader window's word spans are computed against this, so it
+        # stays authoritative even if the system's X11 clipboard changes.
+        self.clipboard = ClipboardStore()
+
+        # Karaoke word-highlight support. `_word_callback(char_start,
+        # char_end)` is invoked (from a background timer thread — the
+        # caller is responsible for marshalling onto the GTK main loop
+        # if it touches widgets) roughly when that word starts playing.
+        self._word_callback = None
+        self._active_timers: list[threading.Timer] = []
+        self._timers_lock = threading.Lock()
+
+        # Fired synchronously, on the calling thread, right as a new
+        # utterance's text lands in self.clipboard — lets the reader
+        # window load the new text immediately instead of waiting for
+        # the tray's next ~500ms poll tick (which would otherwise be
+        # the first place it could notice the clipboard changed).
+        self._speech_started_callback = None
+
     # ── Pipeline management ───────────────────────────────────────────────────
 
     def _get_lang(self) -> str:
@@ -289,6 +325,14 @@ class TTSEngine:
         text = preprocess_text(text)
         if not text:
             return
+
+        # Push the EXACT string being read into the ring buffer — this
+        # is what the reader window displays and what word char-offsets
+        # are computed against, so it must be the preprocessed text
+        # (what the backend actually says), not the raw input.
+        self.clipboard.push(text, source="speak")
+        if self._speech_started_callback:
+            self._speech_started_callback(text)
 
         self._stop_event.clear()
         self._pause_event.set()
@@ -309,9 +353,31 @@ class TTSEngine:
         self._playback_thread.start()
         self._synth_thread.start()
 
+    def load_text(self, text: str):
+        """
+        Loads text into the clipboard ring buffer and notifies the
+        reader window WITHOUT speaking it. For scripts/tools that want
+        to stage text for the reader (or just add it to Recent) without
+        triggering audio — e.g. a note-taking script piping in a draft
+        to proofread visually before deciding to have it read aloud.
+        Does not touch playback state; if something's already speaking,
+        it keeps speaking.
+        """
+        text = preprocess_text(text)
+        if not text:
+            return
+        self.clipboard.push(text, source="load")
+        if self._speech_started_callback:
+            self._speech_started_callback(text)
+
     def pause(self):
         """Pause playback mid-stream."""
         self._pause_event.clear()
+        # Highlighting has no way to "freeze in place mid-word" once a
+        # timer's already scheduled, so pausing just drops the pending
+        # highlight timers. It resumes cleanly at the next chunk
+        # boundary rather than trying to fast-forward/rewind mid-chunk.
+        self._cancel_word_timers()
 
     def resume(self):
         """Resume paused playback."""
@@ -321,6 +387,7 @@ class TTSEngine:
         """Stop all synthesis and playback immediately."""
         self._stop_event.set()
         self._pause_event.set()   # unblock if paused so thread can exit
+        self._cancel_word_timers()
 
         # Drain the queue
         while not self._audio_queue.empty():
@@ -361,6 +428,57 @@ class TTSEngine:
             return
         self.speed = max(0.5, min(2.0, speed))
 
+    def set_word_callback(self, callback):
+        """
+        Register a fn(char_start, char_end) called approximately when
+        each word starts playing, timed against self.clipboard.get().
+        Pass None to disable. Fired from a background timer thread —
+        GTK callers must marshal to the main loop themselves (e.g.
+        GLib.idle_add) before touching widgets.
+        """
+        self._word_callback = callback
+
+    def set_speech_started_callback(self, callback):
+        """Register a fn(text) called synchronously right as speak()
+        pushes new text into self.clipboard. Pass None to disable."""
+        self._speech_started_callback = callback
+
+    def _cancel_word_timers(self):
+        """Kills any pending highlight timers — called on stop()/pause()
+        so highlighting doesn't keep advancing after audio does."""
+        with self._timers_lock:
+            for t in self._active_timers:
+                t.cancel()
+            self._active_timers.clear()
+
+    def _schedule_word_highlights(self, word_matches):
+        """
+        Called right as a chunk's audio starts being dequeued for
+        playback. Schedules one threading.Timer per word in the chunk,
+        each firing the word callback at its estimated offset (see
+        engine/word_timing.py for how offsets are derived).
+        """
+        if not self._word_callback or not word_matches:
+            return
+
+        schedule = build_word_schedule(word_matches, self.speed)
+        for delay_seconds, char_start, char_end in schedule:
+            timer = threading.Timer(
+                delay_seconds, self._fire_word_callback, args=(char_start, char_end)
+            )
+            timer.daemon = True
+            with self._timers_lock:
+                self._active_timers.append(timer)
+            timer.start()
+
+    def _fire_word_callback(self, char_start: int, char_end: int):
+        # Stopped/paused mid-flight? Don't highlight a word for audio
+        # that no longer matches what's playing (or isn't playing at all).
+        if self._stop_event.is_set() or not self._pause_event.is_set():
+            return
+        if self._word_callback:
+            self._word_callback(char_start, char_end)
+
     # ── Internal synthesis ─────────────────────────────────────────────────────
 
     def _synthesize(self, text: str):
@@ -375,9 +493,34 @@ class TTSEngine:
             lang = self._get_lang()
             chunks = split_into_chunks(text)
 
+            # Words are matched against the FULL preprocessed text once,
+            # up front, so char offsets line up with what the reader
+            # window displays (self.clipboard). Chunks are consumed
+            # strictly in order, so we just walk this list forward by
+            # each chunk's own word count — no need for exact char-level
+            # chunk boundaries, which split_into_chunks doesn't preserve
+            # anyway (it rejoins sentences with normalized single spaces).
+            all_words = extract_words(text)
+            word_cursor = 0
+
             for chunk in chunks:
                 if self._stop_event.is_set():
                     break
+
+                chunk_word_count = len(chunk.split())
+                chunk_words = all_words[word_cursor:word_cursor + chunk_word_count]
+                word_cursor += chunk_word_count
+
+                # A marker pushed onto the SAME queue the backend pushes
+                # audio into, right before that chunk's synthesis call.
+                # Because the queue is FIFO and synthesis is single-
+                # threaded/sequential per chunk, this marker is always
+                # dequeued by the playback thread immediately before that
+                # chunk's first real audio piece — i.e. right as that
+                # chunk's audio is about to start playing, which is
+                # exactly when we want to kick off its highlight timers.
+                if chunk_words:
+                    self._audio_queue.put((_WORDS_MARKER, chunk_words))
 
                 self.backend.synthesize_chunk(
                     chunk, self.voice, self.speed, lang,
@@ -422,6 +565,13 @@ class TTSEngine:
 
                 if chunk is None:   # synthesis done
                     break
+
+                # Word-highlight marker, not real audio — schedule this
+                # chunk's karaoke timers and move on to the audio that
+                # follows it in the queue.
+                if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] == _WORDS_MARKER:
+                    self._schedule_word_highlights(chunk[1])
+                    continue
 
                 audio, sample_rate = chunk
 
