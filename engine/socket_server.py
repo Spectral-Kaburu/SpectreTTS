@@ -8,7 +8,7 @@ for commands from:
   - future: any other local script/project that wants to trigger speech
 
 Protocol: simple pipe-delimited text. "COMMAND|payload"
-Commands: speak, pause, resume, stop, voice, speed
+Commands: speak, load, pause, resume, stop, voice, speed
 """
 
 import socket
@@ -87,6 +87,11 @@ class SocketServer:
     def _dispatch(self, command: str, payload: str):
         if command == "speak":
             self.engine.speak(payload)
+        elif command == "load":
+            # Stages text into the ring buffer + reader window without
+            # speaking it — see TTSEngine.load_text() for why this is
+            # useful on its own.
+            self.engine.load_text(payload)
         elif command == "pause":
             self.engine.pause()
         elif command == "resume":
