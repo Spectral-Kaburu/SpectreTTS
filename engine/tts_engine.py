@@ -569,7 +569,7 @@ class TTSEngine:
                 # Word-highlight marker, not real audio — schedule this
                 # chunk's karaoke timers and move on to the audio that
                 # follows it in the queue.
-                if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] == _WORDS_MARKER:
+                if isinstance(chunk, tuple) and len(chunk) == 2 and isinstance(chunk[0], str) and chunk[0] == _WORDS_MARKER:
                     self._schedule_word_highlights(chunk[1])
                     continue
 
