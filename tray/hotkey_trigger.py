@@ -3,7 +3,7 @@
 SpectreTTS - Hotkey Trigger
 -----------------------------
 This script is bound to Ctrl+Alt+R via GNOME's custom keybindings.
-It does NOT load Kokoro itself (too slow to do on every keypress).
+It does NOT load the TTS model itself (too slow to do on every keypress).
 Instead it grabs the current selection and sends it over a local
 Unix socket to the already-running SpectreTTS daemon (systray app),
 which holds the warm model in memory and speaks immediately.
@@ -25,7 +25,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from engine.selection_grabber import get_text_to_read
 from engine.configs import get_socket_path
 

@@ -5,7 +5,7 @@ SpectreTTS - Daemon Entrypoint
 The single process that should be running at all times (ideally
 autostarted at login). It:
 
-  1. Loads the TTSEngine (Kokoro pipeline loads lazily on first speak)
+  1. Loads the TTSEngine (Pipeline loads lazily on first speak)
   2. Starts the Unix socket server (hotkey_trigger.py talks to this)
   3. Draws the systray icon
   4. Runs the GTK main loop, which keeps everything alive
@@ -19,8 +19,11 @@ Stop with the tray menu's "Quit" item, or Ctrl+C in the terminal.
 import os
 import sys
 import signal
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import gi
 gi.require_version("Gtk", "3.0")

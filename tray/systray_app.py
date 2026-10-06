@@ -4,7 +4,8 @@ SpectreTTS - Systray Application
 The visible part of the daemon. Draws a tray icon in the GNOME top bar
 with a dropdown menu for:
   - Pause / Resume / Stop
-  - Voice picker (radio submenu)
+  - Engine picker (radio submenu — hot-swaps the active TTS backend)
+  - Voice picker (radio submenu — rebuilt when the engine changes)
   - Speed picker (radio submenu)
   - Read Clipboard (grabs the system clipboard, speaks it)
   - Recent (last few things read — SpectreTTS's own internal clipboard
@@ -35,18 +36,20 @@ except ValueError:
 from gi.repository import Gtk, GLib
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.tts_engine import VOICES
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from engine.tts_engine import VOICES, BACKENDS
 from engine.selection_grabber import get_clipboard_text
 from tray.reader_window import ReaderWindow
 
 APP_ID = "spectretts"
-ICON_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets"
-)
-ICON_IDLE = os.path.join(ICON_DIR, "icon_idle.svg")
-ICON_SPEAKING = os.path.join(ICON_DIR, "icon_speaking.svg")
+ICON_DIR = PROJECT_ROOT / "assets"
+ICON_IDLE = str(ICON_DIR / "icon_idle.svg")
+ICON_SPEAKING = str(ICON_DIR / "icon_speaking.svg")
 
 SPEED_OPTIONS = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
@@ -106,20 +109,30 @@ class SpectreTray:
 
         self.menu.append(Gtk.SeparatorMenuItem())
 
-        # Voice submenu
-        voice_item = Gtk.MenuItem(label="Voice")
-        voice_submenu = Gtk.Menu()
-        voice_group = []
-        for voice_id, (name, locale, gender) in VOICES.items():
-            label = f"{name} ({locale}, {gender})"
-            radio = Gtk.RadioMenuItem.new_with_label(voice_group, label)
-            voice_group = radio.get_group()
-            if voice_id == self.engine.voice:
+        # Engine submenu — radio buttons, one per backend ID.
+        # Selecting one hot-swaps the backend and rebuilds the Voice submenu.
+        engine_item = Gtk.MenuItem(label="Engine")
+        self._engine_submenu = Gtk.Menu()
+        self._engine_group = []
+        self._engine_radios: dict[str, Gtk.RadioMenuItem] = {}
+        for backend_id in BACKENDS:
+            label = backend_id.capitalize()
+            radio = Gtk.RadioMenuItem.new_with_label(self._engine_group, label)
+            self._engine_group = radio.get_group()
+            if backend_id == self.engine.backend.id:
                 radio.set_active(True)
-            radio.connect("toggled", self._on_voice_selected, voice_id)
-            voice_submenu.append(radio)
-        voice_item.set_submenu(voice_submenu)
-        self.menu.append(voice_item)
+            radio.connect("toggled", self._on_engine_selected, backend_id)
+            self._engine_submenu.append(radio)
+            self._engine_radios[backend_id] = radio
+        engine_item.set_submenu(self._engine_submenu)
+        self.menu.append(engine_item)
+
+        # Voice submenu — rebuilt whenever the backend changes.
+        self.voice_item = Gtk.MenuItem(label="Voice")
+        self._voice_submenu = Gtk.Menu()
+        self.voice_item.set_submenu(self._voice_submenu)
+        self.menu.append(self.voice_item)
+        self._rebuild_voice_submenu()
 
         # Speed submenu
         speed_item = Gtk.MenuItem(label="Speed")
@@ -172,6 +185,28 @@ class SpectreTray:
 
         self.menu.show_all()
 
+    def _rebuild_voice_submenu(self):
+        """
+        Clear and repopulate the Voice submenu from the currently-active
+        backend's voice list. Called once at menu construction and again
+        whenever the backend is swapped at runtime, so the voices shown
+        always match the engine that's actually running.
+        """
+        for child in self._voice_submenu.get_children():
+            self._voice_submenu.remove(child)
+
+        voice_group = []
+        for voice_id, (name, locale, gender) in self.engine.backend.voices.items():
+            label = f"{name} ({locale}, {gender})"
+            radio = Gtk.RadioMenuItem.new_with_label(voice_group, label)
+            voice_group = radio.get_group()
+            if voice_id == self.engine.voice:
+                radio.set_active(True)
+            radio.connect("toggled", self._on_voice_selected, voice_id)
+            self._voice_submenu.append(radio)
+
+        self._voice_submenu.show_all()
+
     # ── Menu callbacks ────────────────────────────────────────────────────────
 
     def _on_pause_resume(self, _widget):
@@ -185,6 +220,20 @@ class SpectreTray:
     def _on_voice_selected(self, widget, voice_id):
         if widget.get_active():
             self.engine.set_voice(voice_id)
+
+    def _on_engine_selected(self, widget, backend_id):
+        if not widget.get_active():
+            return
+        if backend_id == self.engine.backend.id:
+            return   # already on this backend — nothing to do
+        try:
+            self.engine.switch_backend(backend_id)
+        except ValueError as exc:
+            print(f"[SpectreTTS/tray] Engine switch failed: {exc}")
+            return
+        # Rebuild the Voice submenu on the GTK main thread.
+        # switch_backend() already ran stop(), so no audio is in flight.
+        GLib.idle_add(self._rebuild_voice_submenu)
 
     def _on_speed_selected(self, widget, speed):
         if widget.get_active():

@@ -1,12 +1,12 @@
 [Unit]
-Description=SpectreTTS - local TTS daemon (Kokoro-82M)
+Description=SpectreTTS - local TTS daemon
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/Projects/Local-TTS/.venv/bin/python %h/Projects/Local-TTS/tray/daemon.py
-WorkingDirectory=%h/Projects/Local-TTS
+ExecStart={{VENV_PYTHON}} {{DAEMON_SCRIPT}}
+WorkingDirectory={{PROJECT_DIR}}
 Restart=on-failure
 RestartSec=3
 

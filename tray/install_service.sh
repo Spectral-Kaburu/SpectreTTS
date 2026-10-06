@@ -17,8 +17,21 @@ if [ ! -f "$SERVICE_FILE" ]; then
     exit 1
 fi
 
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
+DAEMON_SCRIPT="$SCRIPT_DIR/daemon.py"
+
+if [ ! -x "$VENV_PYTHON" ]; then
+    echo "ERROR: Could not find Python at $VENV_PYTHON"
+    echo "Please create a virtual environment at .venv first."
+    exit 1
+fi
+
 mkdir -p "$TARGET_DIR"
-cp "$SERVICE_FILE" "$TARGET_FILE"
+sed -e "s|{{VENV_PYTHON}}|$VENV_PYTHON|g" \
+    -e "s|{{DAEMON_SCRIPT}}|$DAEMON_SCRIPT|g" \
+    -e "s|{{PROJECT_DIR}}|$PROJECT_DIR|g" \
+    "$SERVICE_FILE" > "$TARGET_FILE"
 
 echo "Reloading systemd user daemon..."
 systemctl --user daemon-reload

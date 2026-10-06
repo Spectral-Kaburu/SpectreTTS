@@ -12,16 +12,12 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRIGGER_SCRIPT="$SCRIPT_DIR/hotkey_trigger.py"
-PYTHON_BIN="$HOME/.python311/bin/python3.11"
-
-# Fall back to venv python if .python311 doesn't exist at this path
-if [ ! -x "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(dirname "$SCRIPT_DIR")/.venv/bin/python3"
-fi
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
 
 if [ ! -x "$PYTHON_BIN" ]; then
-    echo "ERROR: Could not find a Python interpreter to bind."
-    echo "Edit PYTHON_BIN in this script to point at your venv's python3."
+    echo "ERROR: Could not find Python at $PYTHON_BIN"
+    echo "Please create a virtual environment at .venv first."
     exit 1
 fi
 
@@ -31,35 +27,27 @@ NAME="SpectreTTS Read Selection"
 
 BASE_PATH="org.gnome.settings-daemon.plugins.media-keys"
 CUSTOM_BASE="$BASE_PATH.custom-keybinding"
-CUSTOM_PATH_PREFIX="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom"
+FULL_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/customspectretts/"
 
 # Get existing custom keybindings list
 EXISTING=$(gsettings get "$BASE_PATH" custom-keybindings)
 
-# Check if our binding already exists
-if echo "$EXISTING" | grep -q "spectretts"; then
-    echo "SpectreTTS keybinding already registered. Skipping."
-    exit 0
+# Add customspectretts slot if not already in the list
+if ! echo "$EXISTING" | grep -q "customspectretts"; then
+    echo "Registering SpectreTTS in GNOME keybindings list..."
+    if [ "$EXISTING" = "@as []" ] || [ -z "$EXISTING" ]; then
+        NEW_LIST="['$FULL_PATH']"
+    else
+        NEW_LIST=$(echo "$EXISTING" | sed "s|]$|, '$FULL_PATH']|")
+    fi
+    gsettings set "$BASE_PATH" custom-keybindings "$NEW_LIST"
 fi
 
-# Find next available custom slot index
-SLOT_PATH="${CUSTOM_PATH_PREFIX}spectretts/"
-FULL_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/customspectretts/"
-
-# Build the new list (append our entry)
-if [ "$EXISTING" = "@as []" ]; then
-    NEW_LIST="['$FULL_PATH']"
-else
-    # Strip trailing ']' and append
-    NEW_LIST=$(echo "$EXISTING" | sed "s|]$|, '$FULL_PATH']|")
-fi
-
-echo "Registering keybinding..."
-gsettings set "$BASE_PATH" custom-keybindings "$NEW_LIST"
-
-gsettings set "$CUSTOM_BASE:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/customspectretts/" name "$NAME"
-gsettings set "$CUSTOM_BASE:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/customspectretts/" command "$COMMAND"
-gsettings set "$CUSTOM_BASE:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/customspectretts/" binding "$KEYBINDING"
+# Always update the binding details so moving project directories is handled
+echo "Updating keybinding settings..."
+gsettings set "$CUSTOM_BASE:$FULL_PATH" name "$NAME"
+gsettings set "$CUSTOM_BASE:$FULL_PATH" command "$COMMAND"
+gsettings set "$CUSTOM_BASE:$FULL_PATH" binding "$KEYBINDING"
 
 echo "Done. Ctrl+Alt+R is now bound to: $COMMAND"
 echo ""

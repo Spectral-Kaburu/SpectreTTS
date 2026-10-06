@@ -10,7 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load .env from project root (one level up from engine/)
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -31,4 +31,4 @@ def get_backend_name() -> str:
     Returns:
         Backend identifier: "kokoro" or "pocket"
     """
-    return os.environ.get("SPECTRETTS_BACKEND", "kokoro").strip().lower()
+    return os.environ.get("SPECTRETTS_BACKEND", "pocket").strip().lower()
