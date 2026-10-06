@@ -1,9 +1,9 @@
 # SpectreTTS
 
-A local, lightweight text-to-speech daemon for Kali Linux. Highlight any text,
+A local, lightweight text-to-speech daemon for Linux. Highlight any text,
 hit a hotkey, and have it read aloud — no cloud calls, no API keys, no
-GUI window to manage. Built on [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M),
-a compact open-weights TTS model that runs comfortably on CPU.
+GUI window to manage. Features two excellent local TTS engines: **Piper TTS** 
+(extremely fast, CPU-friendly) and **Kyutai Pocket-TTS** (high-quality streaming).
 
 ## Why this exists
 
@@ -19,92 +19,91 @@ Wayland.
 Highlight text → Ctrl+Alt+R → hotkey_trigger.py → /tmp/spectretts.sock → daemon (warm model) → audio out
 ```
 
-The hotkey script is intentionally tiny — it never imports torch or touches
-Kokoro. It just grabs the X11 PRIMARY selection and forwards it over a Unix
-socket to the long-running daemon, which holds the model in RAM and starts
-streaming audio back almost immediately.
+The hotkey script is intentionally tiny — it never imports heavy ML libraries. 
+It just grabs the X11 PRIMARY selection and forwards it over a Unix socket to 
+the long-running daemon, which holds the model in RAM and starts streaming audio back almost immediately.
 
 ```
 spectretts/
 ├── engine/
-│   ├── tts_engine.py          Core Kokoro wrapper — streaming synth + playback
+│   ├── tts_engine.py          Core TTS wrapper — streaming synth + playback
+│   ├── backends/              Pluggable backend engines (Piper, Pocket)
 │   ├── selection_grabber.py   Grabs highlighted text via xclip
 │   └── socket_server.py       Unix socket command listener
 ├── tray/
 │   ├── hotkey_trigger.py      Bound to Ctrl+Alt+R — sends selection to daemon
 │   ├── register_hotkey.sh     One-time GNOME keybinding setup
+│   ├── install_service.sh     Installs background systemd service
 │   ├── systray_app.py         GTK/AppIndicator tray icon + menu
 │   └── daemon.py              Main entrypoint — starts engine + socket + tray
 ├── assets/                    Tray icons
-├── config/                    Saved voice/speed preferences
-└── requirements.txt
+└── setup.sh                   Automated full-setup script
 ```
 
-## Requirements
+## Setup (Automated)
 
-- Python 3.11 (Kokoro's dependency chain, via `misaki`/`spacy`, doesn't yet
-  have prebuilt wheels for 3.13 — see [Notes](#notes-on-python-version) below)
-- `espeak-ng` (phonemization backend)
-- `xclip` (selection grabbing)
-- GTK 3 + AyatanaAppIndicator (tray icon)
-
-System packages:
-```bash
-sudo apt install -y espeak-ng libportaudio2 xclip xdotool \
-  python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
-  libayatana-appindicator3-dev gir1.2-ayatanaappindicator3-0.1
-```
-
-Python packages (inside the venv):
-```bash
-pip install -r requirements.txt
-```
-
-## Setup
+The easiest way to get everything running is to use the provided setup script. 
+It installs all dependencies, creates a virtual environment, installs the systemd service, 
+and sets up your global GNOME hotkey.
 
 ```bash
-# 1. Activate the project venv (Python 3.11)
-source .venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Register the global hotkey (one-time, idempotent)
-chmod +x tray/register_hotkey.sh tray/hotkey_trigger.py
-./tray/register_hotkey.sh
-
-# 4. Start the daemon (loads the model, opens the socket, shows tray icon)
-python tray/daemon.py
+cd SpectreTTS
+./setup.sh
 ```
 
-Once running: highlight any text, anywhere, press `Ctrl+Alt+R`.
+## Setup (Manual)
+
+If you prefer to set it up step-by-step:
+
+1. **System packages:**
+   ```bash
+   sudo apt install -y espeak-ng libportaudio2 xclip xdotool \
+     python3-gi python3-gi-cairo gir1.2-gtk-3.0 \
+     libayatana-appindicator3-dev gir1.2-ayatanaappindicator3-0.1
+   ```
+2. **Virtual Environment & Dependencies:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. **Configuration:**
+   Copy the default `.env` from the setup script, or run `./setup.sh` to generate it. You can switch between `piper` and `pocket` backend here.
+4. **Register the global hotkey (GNOME):**
+   ```bash
+   chmod +x tray/register_hotkey.sh tray/hotkey_trigger.py
+   ./tray/register_hotkey.sh
+   ```
+5. **Start the daemon via systemd (recommended):**
+   ```bash
+   chmod +x tray/install_service.sh
+   ./tray/install_service.sh
+   ```
+   *Or just run `python tray/daemon.py` directly to test it.*
 
 ## Usage
+
+Once running: highlight any text, anywhere, press `Ctrl+Alt+R`.
 
 | Action | How |
 |---|---|
 | Read selected text | Highlight text, `Ctrl+Alt+R` |
 | Pause / resume | Tray icon menu |
 | Stop | Tray icon menu |
-| Change voice | Tray icon menu (54 voices, 8 languages) |
-| Adjust speed | Tray icon menu (0.5x–2.0x) |
+| Change voice | Tray icon menu |
+| Adjust speed | Tray icon menu (Note: Piper supports speed changes, Pocket currently does not) |
+| Reader Window | Tray icon menu -> Toggle Reader Window for a karaoke-style view |
 
-## Notes on Python version
+## Configuration & Voices
 
-Kali's default Python (3.13 at time of writing) doesn't yet have prebuilt
-wheels for `spacy`/`thinc`/`blis`, which Kokoro pulls in transitively via
-`misaki[en]`. Attempting to install on 3.13 triggers a source compile that
-fails on Cython/NumPy ABI mismatches. Building Python 3.11 from source
-(`./configure --prefix=$HOME/.python311 && make && make install`, **without**
-`--enable-optimizations` to avoid the bootstrap profiling step crashing) and
-creating the venv from that interpreter avoids the entire issue, since
-prebuilt wheels exist for 3.11 across the board.
+Models are downloaded automatically from HuggingFace on first use.
+You can configure the active TTS backend by editing the `.env` file in the project root:
 
-This Python 3.11 install lives outside the project (`~/.python311`) and the
-venv references it — don't delete that folder. If you'd rather the venv be
-fully standalone, recreate it with `python3.11 -m venv --copies .venv`,
-which copies the interpreter binary into the venv instead of symlinking it.
+```ini
+SPECTRETTS_BACKEND=piper
+SPECTRETTS_PIPER_VOICE=en_US-lessac-medium
+```
 
 ## License
 
-Kokoro-82M is Apache 2.0. This project's code is yours to do with as you like.
+This project's code is provided as-is. Piper TTS and Pocket-TTS models and engines are governed by their respective licenses (typically MIT or Apache 2.0).

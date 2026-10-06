@@ -6,8 +6,8 @@ currently reading (from engine.clipboard, the internal buffer — see
 engine/clipboard_store.py) and highlights the current word as it's
 spoken.
 
-The highlight is TIME-ESTIMATED, not aligned to real audio (Kokoro
-gives us no per-word timestamps — see engine/word_timing.py for the
+The highlight is TIME-ESTIMATED, not aligned to real audio (the TTS engines
+give us no per-word timestamps — see engine/word_timing.py for the
 estimator this is driven by). It'll drift on long passages. Treat it
 as "roughly where we are", not a karaoke machine with real captions.
 
