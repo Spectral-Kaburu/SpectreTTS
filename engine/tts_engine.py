@@ -25,7 +25,7 @@ import os
 import numpy as np
 import sounddevice as sd
 
-from .backends import get_backend
+from .backends import get_backend, _REGISTRY
 
 # Sibling modules inside engine/ — inserted onto sys.path so this file
 # imports cleanly both as `engine.tts_engine` (daemon.py's usage, repo
@@ -47,6 +47,9 @@ _WORDS_MARKER = "__SPECTRETTS_WORDS__"
 # menu lists Kokoro voices or Pocket-TTS voices automatically depending
 # on SPECTRETTS_BACKEND, with no tray-side changes needed.
 VOICES = get_backend().voices
+
+# Ordered list of backend IDs for the tray's Engine submenu.
+BACKENDS = list(_REGISTRY.keys())
 
 # Note: sample rate isn't a fixed constant — each backend reports it
 # per-chunk (kokoro-onnx via create_stream(), Pocket-TTS via
@@ -428,6 +431,29 @@ class TTSEngine:
             return
         self.speed = max(0.5, min(2.0, speed))
 
+    def switch_backend(self, name: str):
+        """
+        Hot-swap the active TTS backend at runtime.
+
+        Stops any current speech, swaps the backend, and resets voice and
+        speed to the new backend's defaults. Returns the newly-active backend
+        instance so the caller (e.g. the tray) can inspect its voice list
+        and rebuild any voice menu without a second trip into the engine.
+
+        Raises ValueError for unknown backend IDs (propagated from get_backend).
+        """
+        self.stop()
+        with self._lock:
+            new_backend = get_backend(name)
+            self.backend = new_backend
+            self.voice = new_backend.default_voice
+            # Keep speed if the new backend supports it, otherwise reset to 1.0
+            if not new_backend.supports_speed:
+                self.speed = 1.0
+        print(f"[SpectreTTS] Switched to backend '{self.backend.id}'. "
+              f"Voice reset to '{self.voice}'.")
+        return self.backend
+
     def set_word_callback(self, callback):
         """
         Register a fn(char_start, char_end) called approximately when
@@ -639,8 +665,8 @@ if __name__ == "__main__":
     # check the backend's own "did I load" state instead. Every backend
     # keeps its loaded model on self._model or self._kokoro — check
     # whichever this backend actually set.
-    loaded = getattr(engine.backend, "_model", None) or getattr(engine.backend, "_kokoro", None)
-    if loaded is None:
+    loaded = getattr(engine.backend, "_model", None) or getattr(engine.backend, "_kokoro", None) or getattr(engine.backend, "_voices_loaded", None)
+    if not loaded:
         print("FAILED: model never loaded — check the error above.")
         sys.exit(1)
 
