@@ -45,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from engine.tts_engine import VOICES, BACKENDS
 from engine.selection_grabber import get_clipboard_text
 from tray.reader_window import ReaderWindow
+from tray.recent_panel import RecentHistoryPanel
 
 APP_ID = "spectretts"
 ICON_DIR = PROJECT_ROOT / "assets"
@@ -63,6 +64,7 @@ class SpectreTray:
     def __init__(self, engine):
         self.engine = engine
         self.reader = ReaderWindow()
+        self.recent_panel = RecentHistoryPanel(engine)
 
         self.indicator = AppIndicator3.Indicator.new(
             APP_ID,
@@ -158,13 +160,11 @@ class SpectreTray:
         read_clipboard_item.connect("activate", self._on_read_clipboard)
         self.menu.append(read_clipboard_item)
 
-        # Recent — SpectreTTS's own last-5 ring buffer (engine.clipboard),
-        # rebuilt fresh every time the submenu opens so it always
-        # reflects whatever's actually in the buffer right now.
-        self.recent_item = Gtk.MenuItem(label="Recent")
-        self.recent_submenu = Gtk.Menu()
-        self.recent_submenu.connect("show", self._on_recent_submenu_show)
-        self.recent_item.set_submenu(self.recent_submenu)
+        # Recent History — Quick-Settings style dropdown panel (like Wi-Fi / Bluetooth)
+        # Clicking opens a rich interactive panel where sentences can be previewed,
+        # re-spoken, copied, or cleared. Also keeps a direct inline submenu for convenience.
+        self.recent_item = Gtk.MenuItem(label="Recent History ▾")
+        self.recent_item.connect("activate", self._on_recent_clicked)
         self.menu.append(self.recent_item)
 
         self.menu.append(Gtk.SeparatorMenuItem())
@@ -250,29 +250,9 @@ class SpectreTray:
         if text:
             self.engine.speak(text)
 
-    def _on_recent_submenu_show(self, submenu):
-        """Rebuilds the Recent submenu from engine.clipboard right
-        before it's displayed, so it always reflects the current ring
-        buffer contents (last 5, most recent first) rather than
-        whatever it happened to look like at daemon startup."""
-        for child in submenu.get_children():
-            submenu.remove(child)
-
-        entries = self.engine.clipboard.list()
-        if not entries:
-            empty_item = Gtk.MenuItem(label="(nothing read yet)")
-            empty_item.set_sensitive(False)
-            submenu.append(empty_item)
-        else:
-            for entry in entries:
-                preview = entry["text"][:50].replace("\n", " ")
-                if len(entry["text"]) > 50:
-                    preview += "…"
-                item = Gtk.MenuItem(label=preview)
-                item.connect("activate", self._on_recent_selected, entry["text"])
-                submenu.append(item)
-
-        submenu.show_all()
+    def _on_recent_clicked(self, _widget):
+        """Open the Quick-Settings style dropdown panel for recent history."""
+        self.recent_panel.toggle()
 
     def _on_recent_selected(self, _widget, text):
         self.engine.speak(text)

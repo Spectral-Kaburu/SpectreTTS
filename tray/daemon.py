@@ -6,9 +6,11 @@ The single process that should be running at all times (ideally
 autostarted at login). It:
 
   1. Loads the TTSEngine (Pipeline loads lazily on first speak)
-  2. Starts the Unix socket server (hotkey_trigger.py talks to this)
-  3. Draws the systray icon
-  4. Runs the GTK main loop, which keeps everything alive
+  2. Creates the SpeechArbiter (priority queue + audit logging)
+  3. Starts the Unix socket server (hotkey_trigger.py and all other
+     clients talk to this — both JSON and legacy pipe-delimited)
+  4. Draws the systray icon
+  5. Runs the GTK main loop, which keeps everything alive
 
 Run with:
     python tray/daemon.py
@@ -29,9 +31,10 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk
 
-from engine.tts_engine import TTSEngine
+from engine.tts_engine  import TTSEngine
 from engine.socket_server import SocketServer
-from tray.systray_app import SpectreTray
+from engine.gateway     import SpeechArbiter
+from tray.systray_app   import SpectreTray
 
 
 def main():
@@ -41,11 +44,17 @@ def main():
     #    so startup here is instant.
     engine = TTSEngine()
 
-    # 2. Socket server — listens for hotkey_trigger.py and other clients
-    socket_server = SocketServer(engine)
+    # 2. Speech Arbiter — priority queue, pacing, audit logging.
+    #    breathing_pause_sec: silence inserted after each utterance (spec §5).
+    arbiter = SpeechArbiter(engine, breathing_pause_sec=1.2)
+    arbiter.start()
+
+    # 3. Socket server — listens for hotkey_trigger.py and all other clients.
+    #    Now accepts both JSON and legacy pipe-delimited commands.
+    socket_server = SocketServer(engine, arbiter)
     socket_server.start()
 
-    # 3. Systray icon + menu
+    # 4. Systray icon + menu
     tray = SpectreTray(engine)
 
     print("[SpectreTTS] Daemon ready. Tray icon active, socket listening.")
@@ -54,11 +63,12 @@ def main():
     # Allow Ctrl+C in the terminal to cleanly exit the GTK main loop
     def handle_sigint(_sig, _frame):
         print("\n[SpectreTTS] Shutting down...")
+        arbiter.stop()
         engine.stop()
         socket_server.stop()
         Gtk.main_quit()
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT,  handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
     # GLib/GTK main loop blocks here until Quit is selected or signal received.
@@ -70,10 +80,10 @@ def main():
     try:
         Gtk.main()
     finally:
+        arbiter.stop()
         socket_server.stop()
         print("[SpectreTTS] Stopped.")
 
 
 if __name__ == "__main__":
     main()
-    
